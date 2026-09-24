@@ -135,6 +135,7 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 		return fmt.Errorf("opening bucket: %w", err)
 	}
 	defer bucket.Close()
+	setUploadRetry(bucket)
 	bucket = blob.PrefixedBucket(bucket, prefix)
 
 	cacher := &Cacher{}

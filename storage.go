@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 )
@@ -169,11 +170,60 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	return outputID, nil
 }
 
+// uploadTimeout bounds one upload of a small object, retries included. It is
+// also the base of an output's deadline; see outputUploadTimeout.
+//
+// A deadline is needed because the retry loop in the API client runs "up to
+// the context deadline", and storage.WithMaxAttempts does not reach it.
+// Without one, an outage holds the go command open, because the retry never
+// ends.
+//
+// It is a var only so that tests can shrink it; nothing else writes it.
+var uploadTimeout = 10 * time.Second
+
+// minUploadRate is the slowest rate, in bytes per second, at which an output
+// upload may transfer before its deadline stops it. Up to 20 uploads run at
+// once, so the link must carry 20 times this rate for all of them to finish.
+const minUploadRate = 1 << 20
+
+// outputUploadTimeout gives an output of size bytes the time to transfer at
+// minUploadRate on top of uploadTimeout. The deadline covers the transfer as
+// well as the retries, so a fixed one would stop a healthy upload of a large
+// output.
+func outputUploadTimeout(size int64) time.Duration {
+	return uploadTimeout + time.Duration(size/minUploadRate)*time.Second
+}
+
+// setUploadRetry makes the GCS client retry object writes.
+//
+// Reads are idempotent, so the client already retries those. An unconditional
+// write is not, so under the default RetryIdempotent policy a single transient
+// error, such as a 503, fails the upload. For an action marker that fails the
+// go command; for an output it loses the object.
+//
+// RetryAlways is safe for what this uploads. Outputs are named by their
+// content, and a retry of an action marker resends the same empty body and
+// metadata, so writing either one twice is the same as writing it once.
+//
+// Only GCS needs this. The AWS and Azure SDKs retry on their own, and a bucket
+// backed by anything else leaves As unsatisfied and is left alone.
+func setUploadRetry(bucket *blob.Bucket) {
+	var client *storage.Client
+	if !bucket.As(&client) {
+		return
+	}
+
+	client.SetRetry(storage.WithPolicy(storage.RetryAlways))
+}
+
 func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
 	exists, err := b.disk.LinkActionToOutput(ctx, actionID, outputID)
 	if err != nil || exists {
 		return exists, err
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, uploadTimeout)
+	defer cancel()
 
 	return false, b.bucket.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
 		Metadata:    map[string]string{"output_id": outputID},
@@ -213,8 +263,17 @@ func (b *Bucket) Start(ctx context.Context) {
 					continue
 				}
 
+				info, err := f.Stat()
+				if err != nil {
+					f.Close()
+					slog.Error("reading file size for upload", "path", pathname, "err", err)
+					continue
+				}
+
 				now := time.Now()
-				err = b.bucket.Upload(ctx, path.Join(outputDir, filepath.Base(pathname)), f, &blob.WriterOptions{ContentType: "application/octet-stream"})
+				uploadCtx, cancel := context.WithTimeout(ctx, outputUploadTimeout(info.Size()))
+				err = b.bucket.Upload(uploadCtx, path.Join(outputDir, filepath.Base(pathname)), f, &blob.WriterOptions{ContentType: "application/octet-stream"})
+				cancel()
 				f.Close()
 				if err != nil {
 					slog.Error("uploading file", "path", pathname, "err", err, "took", time.Since(now))
